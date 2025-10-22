@@ -3,11 +3,13 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:encrypt/encrypt.dart' as encrypt;
+import 'package:xkyber_crypto/xkyber_crypto.dart';
+
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -15,8 +17,10 @@ void main() async {
   runApp(const QuantumChatApp());
 }
 
+
 class QuantumChatApp extends StatelessWidget {
   const QuantumChatApp({Key? key}) : super(key: key);
+
 
   @override
   Widget build(BuildContext context) {
@@ -34,9 +38,139 @@ class QuantumChatApp extends StatelessWidget {
   }
 }
 
-// Auth Wrapper to check login state and profile completion
+
+// ============= ENCRYPTION SERVICE =============
+class EncryptionService {
+  static const _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
+  
+  // Generate Kyber keypair and store
+  static Future<void> generateAndStoreKeys(String userId) async {
+    try {
+      // Generate Kyber keypair using xkyber_crypto
+      final keyPair = KyberKeyPair.generate();
+      
+      // Convert to Base64
+      final publicKeyBase64 = base64Encode(keyPair.publicKey);
+      final secretKeyBase64 = base64Encode(keyPair.secretKey);
+      
+      // Store locally in secure storage
+      await _storage.write(key: 'publicKey', value: publicKeyBase64);
+      await _storage.write(key: 'secretKey', value: secretKeyBase64);
+      
+      // Store public key in Firestore
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(userId)
+          .set({
+        'publicKey': publicKeyBase64,
+        'keyGeneratedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      
+      print('✓ Kyber keypair generated and stored');
+    } catch (e) {
+      print('Error generating keys: $e');
+      rethrow;
+    }
+  }
+  
+  // Check if keys exist
+  static Future<bool> keysExist() async {
+    final publicKey = await _storage.read(key: 'publicKey');
+    final secretKey = await _storage.read(key: 'secretKey');
+    return publicKey != null && secretKey != null;
+  }
+  
+  // Encrypt message using recipient's public key
+  static Future<Map<String, String>> encryptMessage({
+    required String plainMessage,
+    required String recipientPublicKey,
+  }) async {
+    try {
+      // Decode recipient's Kyber public key
+      final recipientPubKey = base64Decode(recipientPublicKey);
+      
+      // Encapsulate to generate shared secret using xkyber_crypto
+      final encapsulationResult = KyberKEM.encapsulate(recipientPubKey);
+      final sharedSecret = encapsulationResult.sharedSecret;
+      final ciphertext = encapsulationResult.ciphertextKEM;
+      
+      // Derive AES key from shared secret (use first 32 bytes)
+      final aesKeyBytes = sha256.convert(sharedSecret).bytes.sublist(0, 32);
+      final key = encrypt.Key(Uint8List.fromList(aesKeyBytes));
+      
+      // Generate random IV
+      final iv = encrypt.IV.fromSecureRandom(16);
+      
+      // Encrypt message with AES-GCM
+      final encrypter = encrypt.Encrypter(
+        encrypt.AES(key, mode: encrypt.AESMode.gcm),
+      );
+      final encrypted = encrypter.encrypt(plainMessage, iv: iv);
+      
+      return {
+        'encryptedMessage': encrypted.base64,
+        'iv': iv.base64,
+        'kyberCipherText': base64Encode(ciphertext),
+      };
+    } catch (e) {
+      print('Encryption error: $e');
+      rethrow;
+    }
+  }
+  
+  // Decrypt message using own secret key
+  static Future<String> decryptMessage({
+    required String encryptedMessage,
+    required String iv,
+    required String kyberCipherText,
+  }) async {
+    try {
+      // Get secret key from secure storage
+      final secretKeyBase64 = await _storage.read(key: 'secretKey');
+      if (secretKeyBase64 == null) {
+        throw Exception('Secret key not found');
+      }
+      
+      final secretKey = base64Decode(secretKeyBase64);
+      final ciphertext = base64Decode(kyberCipherText);
+      
+      // Decapsulate to recover shared secret using xkyber_crypto
+      final sharedSecret = KyberKEM.decapsulate(ciphertext, secretKey);
+      
+      // Derive AES key from shared secret
+      final aesKeyBytes = sha256.convert(sharedSecret).bytes.sublist(0, 32);
+      final key = encrypt.Key(Uint8List.fromList(aesKeyBytes));
+      
+      // Decrypt message
+      final encrypter = encrypt.Encrypter(
+        encrypt.AES(key, mode: encrypt.AESMode.gcm),
+      );
+      final decrypted = encrypter.decrypt64(
+        encryptedMessage,
+        iv: encrypt.IV.fromBase64(iv),
+      );
+      
+      return decrypted;
+    } catch (e) {
+      print('Decryption error: $e');
+      return '[Decryption failed]';
+    }
+  }
+  
+  // Delete keys on logout
+  static Future<void> deleteKeys() async {
+    await _storage.delete(key: 'publicKey');
+    await _storage.delete(key: 'secretKey');
+  }
+}
+
+
+// ============= AUTH WRAPPER =============
 class AuthWrapper extends StatelessWidget {
   const AuthWrapper({Key? key}) : super(key: key);
+
 
   @override
   Widget build(BuildContext context) {
@@ -50,7 +184,6 @@ class AuthWrapper extends StatelessWidget {
         }
         
         if (snapshot.hasData) {
-          // User is logged in, check if profile is complete
           return FutureBuilder<DocumentSnapshot>(
             future: FirebaseFirestore.instance
                 .collection('users')
@@ -63,17 +196,22 @@ class AuthWrapper extends StatelessWidget {
                 );
               }
 
+
               if (userSnapshot.hasData && userSnapshot.data!.exists) {
                 final userData = userSnapshot.data!.data() as Map<String, dynamic>?;
                 final profileCompleted = userData?['profileCompleted'] ?? false;
 
+
                 if (!profileCompleted) {
                   return UserDetailsScreen(userId: snapshot.data!.uid);
                 }
+                
+                // Ensure keys exist for logged-in user
+                _ensureKeysExist(snapshot.data!.uid);
               } else {
-                // User document doesn't exist, redirect to profile completion
                 return UserDetailsScreen(userId: snapshot.data!.uid);
               }
+
 
               return const MainScreen();
             },
@@ -84,22 +222,33 @@ class AuthWrapper extends StatelessWidget {
       },
     );
   }
+  
+  Future<void> _ensureKeysExist(String userId) async {
+    final keysExist = await EncryptionService.keysExist();
+    if (!keysExist) {
+      await EncryptionService.generateAndStoreKeys(userId);
+    }
+  }
 }
 
-// User Details Collection Screen
+
+// ============= USER DETAILS SCREEN =============
 class UserDetailsScreen extends StatefulWidget {
   final String userId;
   
   const UserDetailsScreen({Key? key, required this.userId}) : super(key: key);
 
+
   @override
   State<UserDetailsScreen> createState() => _UserDetailsScreenState();
 }
+
 
 class _UserDetailsScreenState extends State<UserDetailsScreen> {
   final _nameController = TextEditingController();
   final _ageController = TextEditingController();
   bool _isLoading = false;
+
 
   @override
   void dispose() {
@@ -107,6 +256,7 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
     _ageController.dispose();
     super.dispose();
   }
+
 
   Future<void> _saveUserDetails() async {
     if (_nameController.text.trim().isEmpty || _ageController.text.trim().isEmpty) {
@@ -116,6 +266,7 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
       return;
     }
 
+
     final age = int.tryParse(_ageController.text.trim());
     if (age == null || age < 1 || age > 120) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -124,23 +275,23 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
       return;
     }
 
+
     setState(() => _isLoading = true);
 
+
     try {
-      // Check if document exists
       final docRef = FirebaseFirestore.instance.collection('users').doc(widget.userId);
       final docSnapshot = await docRef.get();
+      final user = FirebaseAuth.instance.currentUser;
+
 
       if (docSnapshot.exists) {
-        // Update existing document
         await docRef.update({
           'name': _nameController.text.trim(),
           'age': age,
           'profileCompleted': true,
         });
       } else {
-        // Create new document
-        final user = FirebaseAuth.instance.currentUser;
         await docRef.set({
           'name': _nameController.text.trim(),
           'age': age,
@@ -150,6 +301,10 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
           'lastActive': FieldValue.serverTimestamp(),
         });
       }
+      
+      // Generate encryption keys
+      await EncryptionService.generateAndStoreKeys(widget.userId);
+
 
       if (mounted) {
         Navigator.of(context).pushReplacement(
@@ -168,6 +323,7 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
       }
     }
   }
+
 
   @override
   Widget build(BuildContext context) {
@@ -191,17 +347,10 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
                   const SizedBox(height: 16),
                   const Text(
                     'Complete Your Profile',
-                    style: TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
+                    style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.white),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    'Tell us a bit about yourself',
-                    style: TextStyle(fontSize: 14, color: Colors.white70),
-                  ),
+                  const Text('Tell us a bit about yourself', style: TextStyle(fontSize: 14, color: Colors.white70)),
                   const SizedBox(height: 48),
                   
                   TextField(
@@ -238,23 +387,15 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
                       onPressed: _isLoading ? null : _saveUserDetails,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.deepPurple,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                       child: _isLoading
                           ? const SizedBox(
                               width: 20,
                               height: 20,
-                              child: CircularProgressIndicator(
-                                color: Colors.white,
-                                strokeWidth: 2,
-                              ),
+                              child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
                             )
-                          : const Text(
-                              'Continue',
-                              style: TextStyle(fontSize: 16),
-                            ),
+                          : const Text('Continue', style: TextStyle(fontSize: 16)),
                     ),
                   ),
                 ],
@@ -267,13 +408,16 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
   }
 }
 
-// Login Screen
+
+// ============= LOGIN SCREEN =============
 class LoginScreen extends StatefulWidget {
   const LoginScreen({Key? key}) : super(key: key);
+
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
 }
+
 
 class _LoginScreenState extends State<LoginScreen> {
   final _emailController = TextEditingController();
@@ -281,12 +425,14 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _isLogin = true;
   bool _isLoading = false;
 
+
   @override
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
     super.dispose();
   }
+
 
   Future<void> _handleEmailAuth() async {
     if (_emailController.text.trim().isEmpty || _passwordController.text.isEmpty) {
@@ -296,47 +442,41 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
 
+
     setState(() => _isLoading = true);
 
+
     try {
-      UserCredential userCredential;
       if (_isLogin) {
-        userCredential = await FirebaseAuth.instance.signInWithEmailAndPassword(
+        await FirebaseAuth.instance.signInWithEmailAndPassword(
           email: _emailController.text.trim(),
           password: _passwordController.text,
         );
       } else {
-        userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        await FirebaseAuth.instance.createUserWithEmailAndPassword(
           email: _emailController.text.trim(),
           password: _passwordController.text,
         );
-        // AuthWrapper will redirect to UserDetailsScreen automatically
       }
     } on FirebaseAuthException catch (e) {
       String message = 'An error occurred';
-      if (e.code == 'user-not-found') {
-        message = 'No user found with this email';
-      } else if (e.code == 'wrong-password') {
-        message = 'Wrong password';
-      } else if (e.code == 'email-already-in-use') {
-        message = 'Email already in use';
-      } else if (e.code == 'weak-password') {
-        message = 'Password is too weak';
-      }
+      if (e.code == 'user-not-found') message = 'No user found with this email';
+      else if (e.code == 'wrong-password') message = 'Wrong password';
+      else if (e.code == 'email-already-in-use') message = 'Email already in use';
+      else if (e.code == 'weak-password') message = 'Password is too weak';
+      
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(message)),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
       }
     } finally {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
+
   Future<void> _handleGoogleSignIn() async {
     setState(() => _isLoading = true);
+
 
     try {
       final GoogleSignInAccount? googleUser = await GoogleSignIn().signIn();
@@ -345,14 +485,15 @@ class _LoginScreenState extends State<LoginScreen> {
         return;
       }
 
+
       final GoogleSignInAuthentication googleAuth = await googleUser.authentication;
       final credential = GoogleAuthProvider.credential(
         accessToken: googleAuth.accessToken,
         idToken: googleAuth.idToken,
       );
 
+
       await FirebaseAuth.instance.signInWithCredential(credential);
-      // AuthWrapper will handle profile completion check
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -360,11 +501,10 @@ class _LoginScreenState extends State<LoginScreen> {
         );
       }
     } finally {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
+      if (mounted) setState(() => _isLoading = false);
     }
   }
+
 
   @override
   Widget build(BuildContext context) {
@@ -386,19 +526,9 @@ class _LoginScreenState extends State<LoginScreen> {
                 children: [
                   const Icon(Icons.lock_outline, size: 80, color: Colors.cyanAccent),
                   const SizedBox(height: 16),
-                  const Text(
-                    'QuantumChat',
-                    style: TextStyle(
-                      fontSize: 32,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
+                  const Text('QuantumChat', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white)),
                   const SizedBox(height: 8),
-                  const Text(
-                    'Quantum-Safe Messaging',
-                    style: TextStyle(fontSize: 14, color: Colors.white70),
-                  ),
+                  const Text('Quantum-Safe Messaging', style: TextStyle(fontSize: 14, color: Colors.white70)),
                   const SizedBox(height: 48),
                   
                   TextField(
@@ -435,23 +565,15 @@ class _LoginScreenState extends State<LoginScreen> {
                       onPressed: _isLoading ? null : _handleEmailAuth,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.deepPurple,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                       child: _isLoading
                           ? const SizedBox(
                               width: 20,
                               height: 20,
-                              child: CircularProgressIndicator(
-                                color: Colors.white,
-                                strokeWidth: 2,
-                              ),
+                              child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
                             )
-                          : Text(
-                              _isLogin ? 'Login' : 'Sign Up',
-                              style: const TextStyle(fontSize: 16),
-                            ),
+                          : Text(_isLogin ? 'Login' : 'Sign Up', style: const TextStyle(fontSize: 16)),
                     ),
                   ),
                   
@@ -460,9 +582,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   TextButton(
                     onPressed: () => setState(() => _isLogin = !_isLogin),
                     child: Text(
-                      _isLogin
-                          ? 'Don\'t have an account? Sign Up'
-                          : 'Already have an account? Login',
+                      _isLogin ? 'Don\'t have an account? Sign Up' : 'Already have an account? Login',
                       style: const TextStyle(color: Colors.cyanAccent),
                     ),
                   ),
@@ -479,9 +599,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       foregroundColor: Colors.white,
                       side: const BorderSide(color: Colors.white54),
                       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                   ),
                 ],
@@ -494,22 +612,27 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 }
 
-// Main Screen with Bottom Navigation
+
+// ============= MAIN SCREEN =============
 class MainScreen extends StatefulWidget {
   const MainScreen({Key? key}) : super(key: key);
+
 
   @override
   State<MainScreen> createState() => _MainScreenState();
 }
 
+
 class _MainScreenState extends State<MainScreen> {
   int _selectedIndex = 0;
+
 
   final List<Widget> _screens = const [
     ChatsScreen(),
     ContactsScreen(),
     SettingsScreen(),
   ];
+
 
   @override
   Widget build(BuildContext context) {
@@ -528,19 +651,19 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-// Chats Screen with FloatingActionButton
+
+// ============= CHATS SCREEN =============
 class ChatsScreen extends StatelessWidget {
   const ChatsScreen({Key? key}) : super(key: key);
+
 
   @override
   Widget build(BuildContext context) {
     final currentUserId = FirebaseAuth.instance.currentUser!.uid;
 
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Chats'),
-        elevation: 0,
-      ),
+      appBar: AppBar(title: const Text('Chats'), elevation: 0),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('chats')
@@ -552,26 +675,22 @@ class ChatsScreen extends StatelessWidget {
             return const Center(child: CircularProgressIndicator());
           }
 
+
           if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
             return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.chat_bubble_outline, size: 80, color: Colors.grey),
-                  const SizedBox(height: 16),
-                  const Text(
-                    'No chats yet',
-                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'Tap + to start a new chat!',
-                    style: TextStyle(color: Colors.grey),
-                  ),
+                children: const [
+                  Icon(Icons.chat_bubble_outline, size: 80, color: Colors.grey),
+                  SizedBox(height: 16),
+                  Text('No chats yet', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  SizedBox(height: 8),
+                  Text('Tap + to start a new chat!', style: TextStyle(color: Colors.grey)),
                 ],
               ),
             );
           }
+
 
           return ListView.builder(
             itemCount: snapshot.data!.docs.length,
@@ -581,16 +700,17 @@ class ChatsScreen extends StatelessWidget {
               final participants = List<String>.from(chatData['participants']);
               final otherUserId = participants.firstWhere((id) => id != currentUserId);
 
+
               return FutureBuilder<DocumentSnapshot>(
                 future: FirebaseFirestore.instance.collection('users').doc(otherUserId).get(),
                 builder: (context, userSnapshot) {
-                  if (!userSnapshot.hasData) {
-                    return const SizedBox.shrink();
-                  }
+                  if (!userSnapshot.hasData) return const SizedBox.shrink();
+
 
                   final userData = userSnapshot.data!.data() as Map<String, dynamic>?;
                   final userName = userData?['name'] ?? 'Unknown';
                   final lastMessage = chatData['lastMessage'] ?? '';
+
 
                   return ListTile(
                     leading: CircleAvatar(
@@ -598,11 +718,7 @@ class ChatsScreen extends StatelessWidget {
                       child: Text(userName[0].toUpperCase()),
                     ),
                     title: Text(userName),
-                    subtitle: Text(
-                      lastMessage,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                    subtitle: Text(lastMessage, maxLines: 1, overflow: TextOverflow.ellipsis),
                     onTap: () {
                       Navigator.push(
                         context,
@@ -636,18 +752,20 @@ class ChatsScreen extends StatelessWidget {
   }
 }
 
-// Contacts Screen
+
+// ============= CONTACTS SCREEN =============
 class ContactsScreen extends StatelessWidget {
   const ContactsScreen({Key? key}) : super(key: key);
+
 
   Future<void> _createOrOpenChat(BuildContext context, String otherUserId, String otherUserName) async {
     final currentUserId = FirebaseAuth.instance.currentUser!.uid;
     
-    // Check if chat already exists
     final existingChats = await FirebaseFirestore.instance
         .collection('chats')
         .where('participants', arrayContains: currentUserId)
         .get();
+
 
     String? chatId;
     for (var doc in existingChats.docs) {
@@ -658,18 +776,18 @@ class ContactsScreen extends StatelessWidget {
       }
     }
 
-    // Create new chat if doesn't exist
+
     if (chatId == null) {
       final newChat = await FirebaseFirestore.instance.collection('chats').add({
         'participants': [currentUserId, otherUserId],
         'createdAt': FieldValue.serverTimestamp(),
-        'lastMessage': '',
+        'lastMessage': 'Chat started',
         'lastMessageTime': FieldValue.serverTimestamp(),
       });
       chatId = newChat.id;
     }
 
-    // Navigate to chat window
+
     if (context.mounted) {
       Navigator.pushReplacement(
         context,
@@ -684,15 +802,14 @@ class ContactsScreen extends StatelessWidget {
     }
   }
 
+
   @override
   Widget build(BuildContext context) {
     final currentUserId = FirebaseAuth.instance.currentUser!.uid;
 
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Start New Chat'),
-        elevation: 0,
-      ),
+      appBar: AppBar(title: const Text('Start New Chat'), elevation: 0),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance.collection('users').snapshots(),
         builder: (context, snapshot) {
@@ -700,19 +817,22 @@ class ContactsScreen extends StatelessWidget {
             return const Center(child: CircularProgressIndicator());
           }
 
+
           if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
             return const Center(child: Text('No users found'));
           }
+
 
           final users = snapshot.data!.docs
               .where((doc) => doc.id != currentUserId && (doc.data() as Map<String, dynamic>)['profileCompleted'] == true)
               .toList();
 
+
           if (users.isEmpty) {
-            return const Center(
+            return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
-                children: [
+                children: const [
                   Icon(Icons.people_outline, size: 80, color: Colors.grey),
                   SizedBox(height: 16),
                   Text('No other users yet', style: TextStyle(fontSize: 18)),
@@ -720,6 +840,7 @@ class ContactsScreen extends StatelessWidget {
               ),
             );
           }
+
 
           return ListView.builder(
             itemCount: users.length,
@@ -729,6 +850,7 @@ class ContactsScreen extends StatelessWidget {
               final userName = userData['name'] ?? 'Unknown';
               final userEmail = userData['email'] ?? '';
               final userAge = userData['age']?.toString() ?? 'N/A';
+
 
               return ListTile(
                 leading: CircleAvatar(
@@ -748,11 +870,13 @@ class ContactsScreen extends StatelessWidget {
   }
 }
 
-// Chat Window
+
+// ============= CHAT WINDOW WITH ENCRYPTION =============
 class ChatWindow extends StatefulWidget {
   final String chatId;
   final String otherUserId;
   final String otherUserName;
+
 
   const ChatWindow({
     Key? key,
@@ -761,13 +885,16 @@ class ChatWindow extends StatefulWidget {
     required this.otherUserName,
   }) : super(key: key);
 
+
   @override
   State<ChatWindow> createState() => _ChatWindowState();
 }
 
+
 class _ChatWindowState extends State<ChatWindow> {
   final _messageController = TextEditingController();
   final _scrollController = ScrollController();
+
 
   @override
   void dispose() {
@@ -776,30 +903,56 @@ class _ChatWindowState extends State<ChatWindow> {
     super.dispose();
   }
 
+
   Future<void> _sendMessage() async {
     if (_messageController.text.trim().isEmpty) return;
+
 
     final currentUserId = FirebaseAuth.instance.currentUser!.uid;
     final messageText = _messageController.text.trim();
     _messageController.clear();
 
+
     try {
-      // Send message (simplified without encryption for now)
+      // Get recipient's public key
+      final recipientDoc = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(widget.otherUserId)
+          .get();
+      
+      final recipientPublicKey = recipientDoc.data()?['publicKey'] as String?;
+      
+      if (recipientPublicKey == null) {
+        throw Exception('Recipient public key not found');
+      }
+      
+      // Encrypt message
+      final encryptedData = await EncryptionService.encryptMessage(
+        plainMessage: messageText,
+        recipientPublicKey: recipientPublicKey,
+      );
+      
+      // Save encrypted message to Firebase
       await FirebaseFirestore.instance
           .collection('chats')
           .doc(widget.chatId)
           .collection('messages')
           .add({
         'senderId': currentUserId,
-        'message': messageText,
+        'encryptedMessage': encryptedData['encryptedMessage'],
+        'iv': encryptedData['iv'],
+        'kyberCipherText': encryptedData['kyberCipherText'],
+        'isEncrypted': true,
         'timestamp': FieldValue.serverTimestamp(),
       });
 
+
       // Update last message
       await FirebaseFirestore.instance.collection('chats').doc(widget.chatId).update({
-        'lastMessage': messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText,
+        'lastMessage': 'Encrypted message 🔒',
         'lastMessageTime': FieldValue.serverTimestamp(),
       });
+
 
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
@@ -817,13 +970,21 @@ class _ChatWindowState extends State<ChatWindow> {
     }
   }
 
+
   @override
   Widget build(BuildContext context) {
     final currentUserId = FirebaseAuth.instance.currentUser!.uid;
 
+
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.otherUserName),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(widget.otherUserName),
+            const Text('🔒 End-to-end encrypted', style: TextStyle(fontSize: 10, color: Colors.green)),
+          ],
+        ),
         elevation: 0,
       ),
       body: Column(
@@ -841,11 +1002,13 @@ class _ChatWindowState extends State<ChatWindow> {
                   return const Center(child: CircularProgressIndicator());
                 }
 
+
                 if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
                   return const Center(
                     child: Text('No messages yet\nSay hi! 👋', textAlign: TextAlign.center),
                   );
                 }
+
 
                 return ListView.builder(
                   controller: _scrollController,
@@ -857,25 +1020,49 @@ class _ChatWindowState extends State<ChatWindow> {
                     final messageData = messageDoc.data() as Map<String, dynamic>;
                     final senderId = messageData['senderId'];
                     final isMe = senderId == currentUserId;
-                    final messageText = messageData['message'] ?? '';
+                    final isEncrypted = messageData['isEncrypted'] ?? false;
 
-                    return Align(
-                      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-                      child: Container(
-                        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                        constraints: BoxConstraints(
-                          maxWidth: MediaQuery.of(context).size.width * 0.7,
-                        ),
-                        decoration: BoxDecoration(
-                          color: isMe ? Colors.deepPurple : Colors.grey[800],
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        child: Text(
-                          messageText,
-                          style: const TextStyle(color: Colors.white),
-                        ),
-                      ),
+
+                    return FutureBuilder<String>(
+                      future: isEncrypted
+                          ? EncryptionService.decryptMessage(
+                              encryptedMessage: messageData['encryptedMessage'],
+                              iv: messageData['iv'],
+                              kyberCipherText: messageData['kyberCipherText'],
+                            )
+                          : Future.value(messageData['message'] ?? ''),
+                      builder: (context, decryptSnapshot) {
+                        if (!decryptSnapshot.hasData) {
+                          return Align(
+                            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                            child: Container(
+                              margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              padding: const EdgeInsets.all(12),
+                              child: const CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          );
+                        }
+
+
+                        return Align(
+                          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                            constraints: BoxConstraints(
+                              maxWidth: MediaQuery.of(context).size.width * 0.7,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isMe ? Colors.deepPurple : Colors.grey[800],
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: Text(
+                              decryptSnapshot.data!,
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                          ),
+                        );
+                      },
                     );
                   },
                 );
@@ -930,12 +1117,13 @@ class _ChatWindowState extends State<ChatWindow> {
   }
 }
 
-// Settings Screen with Delete Account
+
+// ============= SETTINGS SCREEN =============
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({Key? key}) : super(key: key);
 
+
   Future<void> _deleteAccount(BuildContext context) async {
-    // Show confirmation dialog
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -957,38 +1145,43 @@ class SettingsScreen extends StatelessWidget {
       ),
     );
 
+
     if (confirmed != true) return;
+
 
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) return;
 
+
       final userId = user.uid;
 
-      // Delete user data from Firestore
+
       await FirebaseFirestore.instance.collection('users').doc(userId).delete();
 
-      // Delete all chats where user is a participant
+
       final chats = await FirebaseFirestore.instance
           .collection('chats')
           .where('participants', arrayContains: userId)
           .get();
 
+
       for (var chat in chats.docs) {
-        // Delete all messages in the chat
         final messages = await chat.reference.collection('messages').get();
         for (var message in messages.docs) {
           await message.reference.delete();
         }
-        // Delete the chat document
         await chat.reference.delete();
       }
 
-      // Delete Firebase Auth account
-      await user.delete();
 
-      // Sign out from Google
+      // Delete encryption keys
+      await EncryptionService.deleteKeys();
+
+
+      await user.delete();
       await GoogleSignIn().signOut();
+
 
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1021,15 +1214,14 @@ class SettingsScreen extends StatelessWidget {
     }
   }
 
+
   @override
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser!;
 
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Settings'),
-        elevation: 0,
-      ),
+      appBar: AppBar(title: const Text('Settings'), elevation: 0),
       body: StreamBuilder<DocumentSnapshot>(
         stream: FirebaseFirestore.instance.collection('users').doc(user.uid).snapshots(),
         builder: (context, snapshot) {
@@ -1037,7 +1229,9 @@ class SettingsScreen extends StatelessWidget {
             return const Center(child: CircularProgressIndicator());
           }
 
+
           final userData = snapshot.data?.data() as Map<String, dynamic>?;
+
 
           return ListView(
             padding: const EdgeInsets.all(16),
@@ -1057,10 +1251,7 @@ class SettingsScreen extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
-                        'Profile Information',
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                      ),
+                      const Text('Profile Information', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                       const Divider(),
                       _buildInfoRow('Name', userData?['name'] ?? 'N/A'),
                       _buildInfoRow('Email', userData?['email'] ?? 'N/A'),
@@ -1075,13 +1266,14 @@ class SettingsScreen extends StatelessWidget {
                 child: ListTile(
                   leading: const Icon(Icons.security),
                   title: const Text('Quantum Security'),
-                  subtitle: const Text('End-to-end encryption enabled'),
+                  subtitle: const Text('Kyber + AES-GCM encryption'),
                   trailing: const Icon(Icons.check_circle, color: Colors.green),
                 ),
               ),
               const SizedBox(height: 24),
               ElevatedButton.icon(
                 onPressed: () async {
+                  await EncryptionService.deleteKeys();
                   await FirebaseAuth.instance.signOut();
                   await GoogleSignIn().signOut();
                 },
@@ -1109,6 +1301,7 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
+
   Widget _buildInfoRow(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -1117,17 +1310,9 @@ class SettingsScreen extends StatelessWidget {
         children: [
           SizedBox(
             width: 100,
-            child: Text(
-              label,
-              style: const TextStyle(fontWeight: FontWeight.w500, color: Colors.grey),
-            ),
+            child: Text(label, style: const TextStyle(fontWeight: FontWeight.w500, color: Colors.grey)),
           ),
-          Expanded(
-            child: Text(
-              value,
-              style: const TextStyle(color: Colors.white),
-            ),
-          ),
+          Expanded(child: Text(value, style: const TextStyle(color: Colors.white))),
         ],
       ),
     );
