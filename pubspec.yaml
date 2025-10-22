@@ -31,17 +31,22 @@ dependencies:
   flutter:
     sdk: flutter
   
-    # Firebase
+  # Firebase
   firebase_core: ^3.6.0
   firebase_auth: ^5.3.1
   cloud_firestore: ^5.4.4
+  firebase_storage: ^12.3.4  # NEW
   google_sign_in: ^6.2.1
   
-  # Encryption (Quantum-Safe) - CORRECTED PACKAGE
+  # Encryption
   xkyber_crypto: ^1.0.8
   encrypt: ^5.0.3
   crypto: ^3.0.5
   flutter_secure_storage: ^9.2.2
+  
+  # Image Picker
+  image_picker: ^1.1.2  # NEW
+
 
 
 
