@@ -30,21 +30,14 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  
-  # Firebase packages
-  firebase_core: ^2.24.2
-  firebase_auth: ^4.15.3
-  cloud_firestore: ^4.13.6
-  
-  # Google Sign-In
-  google_sign_in: ^6.1.6
-  
-  # Storage
-  shared_preferences: ^2.2.2
-  
-  # Encryption
-  crypto: ^3.0.3
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.1
+  cloud_firestore: ^5.4.4
+  google_sign_in: ^6.2.2
+  shared_preferences: ^2.3.2
+  crypto: ^3.0.5
   encrypt: ^5.0.3
+
 
 dev_dependencies:
   flutter_test:
