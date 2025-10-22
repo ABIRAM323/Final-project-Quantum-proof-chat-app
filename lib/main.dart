@@ -5,6 +5,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'dart:convert';
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:encrypt/encrypt.dart' as encrypt;
@@ -33,8 +34,137 @@ class QuantumChatApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF0A0A0A),
         fontFamily: 'Poppins',
       ),
-      home: const AuthWrapper(),
+      home: const SplashScreen(),
     );
+  }
+}
+
+
+// ============= SPLASH SCREEN =============
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({Key? key}) : super(key: key);
+
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+
+class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _fadeAnimation;
+
+
+  @override
+  void initState() {
+    super.initState();
+    
+    _controller = AnimationController(
+      duration: const Duration(seconds: 2),
+      vsync: this,
+    );
+    
+    _fadeAnimation = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeIn,
+    );
+    
+    _controller.forward();
+    
+    Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (context) => const AuthWrapper()),
+        );
+      }
+    });
+  }
+
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF1A1A2E), Color(0xFF16213E), Color(0xFF0F3460)],
+          ),
+        ),
+        child: Center(
+          child: FadeTransition(
+            opacity: _fadeAnimation,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.lock_outline,
+                  size: 100,
+                  color: Colors.cyanAccent,
+                ),
+                const SizedBox(height: 24),
+                const Text(
+                  'QuantumChat',
+                  style: TextStyle(
+                    fontSize: 36,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Quantum-Safe Messaging',
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: Colors.white70,
+                  ),
+                ),
+                const SizedBox(height: 48),
+                const CircularProgressIndicator(color: Colors.cyanAccent),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+// ============= PRESENCE SERVICE =============
+class PresenceService {
+  static Timer? _presenceTimer;
+  
+  static void startPresenceUpdates(String userId) {
+    updatePresence(userId, true);
+    
+    _presenceTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+      updatePresence(userId, true);
+    });
+  }
+  
+  static Future<void> updatePresence(String userId, bool isOnline) async {
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(userId).update({
+        'isOnline': isOnline,
+        'lastSeen': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      print('Error updating presence: $e');
+    }
+  }
+  
+  static void stopPresenceUpdates(String userId) {
+    _presenceTimer?.cancel();
+    updatePresence(userId, false);
   }
 }
 
@@ -45,21 +175,16 @@ class EncryptionService {
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
   );
   
-  // Generate Kyber keypair and store
   static Future<void> generateAndStoreKeys(String userId) async {
     try {
-      // Generate Kyber keypair using xkyber_crypto
       final keyPair = KyberKeyPair.generate();
       
-      // Convert to Base64
       final publicKeyBase64 = base64Encode(keyPair.publicKey);
       final secretKeyBase64 = base64Encode(keyPair.secretKey);
       
-      // Store locally in secure storage
       await _storage.write(key: 'publicKey', value: publicKeyBase64);
       await _storage.write(key: 'secretKey', value: secretKeyBase64);
       
-      // Store public key in Firestore
       await FirebaseFirestore.instance
           .collection('users')
           .doc(userId)
@@ -75,35 +200,26 @@ class EncryptionService {
     }
   }
   
-  // Check if keys exist
   static Future<bool> keysExist() async {
     final publicKey = await _storage.read(key: 'publicKey');
     final secretKey = await _storage.read(key: 'secretKey');
     return publicKey != null && secretKey != null;
   }
   
-  // Encrypt message using recipient's public key
   static Future<Map<String, String>> encryptMessage({
     required String plainMessage,
     required String recipientPublicKey,
   }) async {
     try {
-      // Decode recipient's Kyber public key
       final recipientPubKey = base64Decode(recipientPublicKey);
-      
-      // Encapsulate to generate shared secret using xkyber_crypto
       final encapsulationResult = KyberKEM.encapsulate(recipientPubKey);
       final sharedSecret = encapsulationResult.sharedSecret;
       final ciphertext = encapsulationResult.ciphertextKEM;
       
-      // Derive AES key from shared secret (use first 32 bytes)
       final aesKeyBytes = sha256.convert(sharedSecret).bytes.sublist(0, 32);
       final key = encrypt.Key(Uint8List.fromList(aesKeyBytes));
-      
-      // Generate random IV
       final iv = encrypt.IV.fromSecureRandom(16);
       
-      // Encrypt message with AES-GCM
       final encrypter = encrypt.Encrypter(
         encrypt.AES(key, mode: encrypt.AESMode.gcm),
       );
@@ -120,30 +236,22 @@ class EncryptionService {
     }
   }
   
-  // Decrypt message using own secret key
   static Future<String> decryptMessage({
     required String encryptedMessage,
     required String iv,
     required String kyberCipherText,
   }) async {
     try {
-      // Get secret key from secure storage
       final secretKeyBase64 = await _storage.read(key: 'secretKey');
-      if (secretKeyBase64 == null) {
-        throw Exception('Secret key not found');
-      }
+      if (secretKeyBase64 == null) throw Exception('Secret key not found');
       
       final secretKey = base64Decode(secretKeyBase64);
       final ciphertext = base64Decode(kyberCipherText);
-      
-      // Decapsulate to recover shared secret using xkyber_crypto
       final sharedSecret = KyberKEM.decapsulate(ciphertext, secretKey);
       
-      // Derive AES key from shared secret
       final aesKeyBytes = sha256.convert(sharedSecret).bytes.sublist(0, 32);
       final key = encrypt.Key(Uint8List.fromList(aesKeyBytes));
       
-      // Decrypt message
       final encrypter = encrypt.Encrypter(
         encrypt.AES(key, mode: encrypt.AESMode.gcm),
       );
@@ -159,7 +267,6 @@ class EncryptionService {
     }
   }
   
-  // Delete keys on logout
   static Future<void> deleteKeys() async {
     await _storage.delete(key: 'publicKey');
     await _storage.delete(key: 'secretKey');
@@ -184,6 +291,8 @@ class AuthWrapper extends StatelessWidget {
         }
         
         if (snapshot.hasData) {
+          PresenceService.startPresenceUpdates(snapshot.data!.uid);
+          
           return FutureBuilder<DocumentSnapshot>(
             future: FirebaseFirestore.instance
                 .collection('users')
@@ -206,7 +315,6 @@ class AuthWrapper extends StatelessWidget {
                   return UserDetailsScreen(userId: snapshot.data!.uid);
                 }
                 
-                // Ensure keys exist for logged-in user
                 _ensureKeysExist(snapshot.data!.uid);
               } else {
                 return UserDetailsScreen(userId: snapshot.data!.uid);
@@ -290,6 +398,8 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
           'name': _nameController.text.trim(),
           'age': age,
           'profileCompleted': true,
+          'isOnline': true,
+          'lastSeen': FieldValue.serverTimestamp(),
         });
       } else {
         await docRef.set({
@@ -298,11 +408,11 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
           'email': user?.email ?? '',
           'profileCompleted': true,
           'createdAt': FieldValue.serverTimestamp(),
-          'lastActive': FieldValue.serverTimestamp(),
+          'isOnline': true,
+          'lastSeen': FieldValue.serverTimestamp(),
         });
       }
       
-      // Generate encryption keys
       await EncryptionService.generateAndStoreKeys(widget.userId);
 
 
@@ -318,9 +428,7 @@ class _UserDetailsScreenState extends State<UserDetailsScreen> {
         );
       }
     } finally {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -623,15 +731,41 @@ class MainScreen extends StatefulWidget {
 }
 
 
-class _MainScreenState extends State<MainScreen> {
+class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   int _selectedIndex = 0;
 
 
   final List<Widget> _screens = const [
     ChatsScreen(),
-    ContactsScreen(),
     SettingsScreen(),
   ];
+
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+    if (userId != null) {
+      if (state == AppLifecycleState.resumed) {
+        PresenceService.updatePresence(userId, true);
+      } else if (state == AppLifecycleState.paused) {
+        PresenceService.updatePresence(userId, false);
+      }
+    }
+  }
 
 
   @override
@@ -643,7 +777,6 @@ class _MainScreenState extends State<MainScreen> {
         onTap: (index) => setState(() => _selectedIndex = index),
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.chat), label: 'Chats'),
-          BottomNavigationBarItem(icon: Icon(Icons.contacts), label: 'Contacts'),
           BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Settings'),
         ],
       ),
@@ -653,30 +786,60 @@ class _MainScreenState extends State<MainScreen> {
 
 
 // ============= CHATS SCREEN =============
-class ChatsScreen extends StatelessWidget {
+class ChatsScreen extends StatefulWidget {
   const ChatsScreen({Key? key}) : super(key: key);
 
+  @override
+  State<ChatsScreen> createState() => _ChatsScreenState();
+}
+
+class _ChatsScreenState extends State<ChatsScreen> {
+  final _currentUserId = FirebaseAuth.instance.currentUser!.uid;
+
+  @override
+  void initState() {
+    super.initState();
+    print('🔍 ChatsScreen initialized for user: $_currentUserId');
+  }
 
   @override
   Widget build(BuildContext context) {
-    final currentUserId = FirebaseAuth.instance.currentUser!.uid;
-
-
     return Scaffold(
       appBar: AppBar(title: const Text('Chats'), elevation: 0),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('chats')
-            .where('participants', arrayContains: currentUserId)
-            .orderBy('lastMessageTime', descending: true)
+            .where('participants', arrayContains: _currentUserId)
             .snapshots(),
         builder: (context, snapshot) {
+          print('🔍 StreamBuilder state: ${snapshot.connectionState}');
+          print('🔍 Has data: ${snapshot.hasData}');
+          print('🔍 Docs count: ${snapshot.data?.docs.length ?? 0}');
+          
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
 
+          if (snapshot.hasError) {
+            print('❌ Stream error: ${snapshot.error}');
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.error, size: 60, color: Colors.red),
+                  const SizedBox(height: 16),
+                  Text('Error: ${snapshot.error}'),
+                  ElevatedButton(
+                    onPressed: () => setState(() {}),
+                    child: const Text('Retry'),
+                  ),
+                ],
+              ),
+            );
+          }
 
           if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+            print('📭 No chats found');
             return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -691,31 +854,59 @@ class ChatsScreen extends StatelessWidget {
             );
           }
 
+          final chats = snapshot.data!.docs;
+          print('✅ Found ${chats.length} chats');
+          
+          chats.sort((a, b) {
+            final aTime = (a.data() as Map<String, dynamic>)['lastMessageTime'] as Timestamp?;
+            final bTime = (b.data() as Map<String, dynamic>)['lastMessageTime'] as Timestamp?;
+            if (aTime == null) return 1;
+            if (bTime == null) return -1;
+            return bTime.compareTo(aTime);
+          });
 
           return ListView.builder(
-            itemCount: snapshot.data!.docs.length,
+            itemCount: chats.length,
             itemBuilder: (context, index) {
-              final chatDoc = snapshot.data!.docs[index];
+              final chatDoc = chats[index];
               final chatData = chatDoc.data() as Map<String, dynamic>;
               final participants = List<String>.from(chatData['participants']);
-              final otherUserId = participants.firstWhere((id) => id != currentUserId);
+              final otherUserId = participants.firstWhere((id) => id != _currentUserId);
 
+              print('💬 Chat ${index + 1}: ${chatDoc.id}');
 
-              return FutureBuilder<DocumentSnapshot>(
-                future: FirebaseFirestore.instance.collection('users').doc(otherUserId).get(),
+              return StreamBuilder<DocumentSnapshot>(
+                stream: FirebaseFirestore.instance.collection('users').doc(otherUserId).snapshots(),
                 builder: (context, userSnapshot) {
                   if (!userSnapshot.hasData) return const SizedBox.shrink();
 
-
                   final userData = userSnapshot.data!.data() as Map<String, dynamic>?;
                   final userName = userData?['name'] ?? 'Unknown';
+                  final isOnline = userData?['isOnline'] ?? false;
                   final lastMessage = chatData['lastMessage'] ?? '';
 
-
                   return ListTile(
-                    leading: CircleAvatar(
-                      backgroundColor: Colors.deepPurple,
-                      child: Text(userName[0].toUpperCase()),
+                    leading: Stack(
+                      children: [
+                        CircleAvatar(
+                          backgroundColor: Colors.deepPurple,
+                          child: Text(userName[0].toUpperCase()),
+                        ),
+                        if (isOnline)
+                          Positioned(
+                            right: 0,
+                            bottom: 0,
+                            child: Container(
+                              width: 12,
+                              height: 12,
+                              decoration: BoxDecoration(
+                                color: Colors.green,
+                                shape: BoxShape.circle,
+                                border: Border.all(color: Colors.black, width: 2),
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
                     title: Text(userName),
                     subtitle: Text(lastMessage, maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -739,8 +930,8 @@ class ChatsScreen extends StatelessWidget {
         },
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () {
-          Navigator.push(
+        onPressed: () async {
+          await Navigator.push(
             context,
             MaterialPageRoute(builder: (context) => const ContactsScreen()),
           );
@@ -761,44 +952,74 @@ class ContactsScreen extends StatelessWidget {
   Future<void> _createOrOpenChat(BuildContext context, String otherUserId, String otherUserName) async {
     final currentUserId = FirebaseAuth.instance.currentUser!.uid;
     
-    final existingChats = await FirebaseFirestore.instance
-        .collection('chats')
-        .where('participants', arrayContains: currentUserId)
-        .get();
+    print('🔄 Creating/opening chat with $otherUserName ($otherUserId)');
+    
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator()),
+    );
+    
+    try {
+      final existingChats = await FirebaseFirestore.instance
+          .collection('chats')
+          .where('participants', isEqualTo: [currentUserId, otherUserId])
+          .get();
 
-
-    String? chatId;
-    for (var doc in existingChats.docs) {
-      final participants = List<String>.from(doc['participants']);
-      if (participants.contains(otherUserId)) {
-        chatId = doc.id;
-        break;
+      String? chatId;
+      
+      if (existingChats.docs.isEmpty) {
+        final reverseChats = await FirebaseFirestore.instance
+            .collection('chats')
+            .where('participants', isEqualTo: [otherUserId, currentUserId])
+            .get();
+        
+        if (reverseChats.docs.isNotEmpty) {
+          chatId = reverseChats.docs.first.id;
+          print('✅ Found existing chat (reverse): $chatId');
+        }
+      } else {
+        chatId = existingChats.docs.first.id;
+        print('✅ Found existing chat: $chatId');
       }
-    }
 
+      if (chatId == null) {
+        print('📝 Creating new chat...');
+        final newChat = await FirebaseFirestore.instance.collection('chats').add({
+          'participants': [currentUserId, otherUserId],
+          'createdAt': FieldValue.serverTimestamp(),
+          'lastMessage': 'Start chatting! 💬',
+          'lastMessageTime': FieldValue.serverTimestamp(),
+        });
+        chatId = newChat.id;
+        print('✅ New chat created: $chatId');
+      }
 
-    if (chatId == null) {
-      final newChat = await FirebaseFirestore.instance.collection('chats').add({
-        'participants': [currentUserId, otherUserId],
-        'createdAt': FieldValue.serverTimestamp(),
-        'lastMessage': 'Chat started',
-        'lastMessageTime': FieldValue.serverTimestamp(),
-      });
-      chatId = newChat.id;
-    }
-
-
-    if (context.mounted) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (context) => ChatWindow(
-            chatId: chatId!,
-            otherUserId: otherUserId,
-            otherUserName: otherUserName,
+      if (context.mounted) {
+        Navigator.pop(context); // Close loading
+        Navigator.pop(context); // Go back to chats
+        
+        await Future.delayed(const Duration(milliseconds: 300));
+        
+        await Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => ChatWindow(
+              chatId: chatId!,
+              otherUserId: otherUserId,
+              otherUserName: otherUserName,
+            ),
           ),
-        ),
-      );
+        );
+      }
+    } catch (e) {
+      print('❌ Error: $e');
+      if (context.mounted) {
+        Navigator.pop(context);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+        );
+      }
     }
   }
 
@@ -824,7 +1045,10 @@ class ContactsScreen extends StatelessWidget {
 
 
           final users = snapshot.data!.docs
-              .where((doc) => doc.id != currentUserId && (doc.data() as Map<String, dynamic>)['profileCompleted'] == true)
+              .where((doc) => 
+                doc.id != currentUserId && 
+                (doc.data() as Map<String, dynamic>)['profileCompleted'] == true
+              )
               .toList();
 
 
@@ -848,17 +1072,37 @@ class ContactsScreen extends StatelessWidget {
               final userDoc = users[index];
               final userData = userDoc.data() as Map<String, dynamic>;
               final userName = userData['name'] ?? 'Unknown';
-              final userEmail = userData['email'] ?? '';
-              final userAge = userData['age']?.toString() ?? 'N/A';
+              final isOnline = userData['isOnline'] ?? false;
 
 
               return ListTile(
-                leading: CircleAvatar(
-                  backgroundColor: Colors.deepPurple,
-                  child: Text(userName[0].toUpperCase()),
+                leading: Stack(
+                  children: [
+                    CircleAvatar(
+                      backgroundColor: Colors.deepPurple,
+                      child: Text(userName[0].toUpperCase()),
+                    ),
+                    if (isOnline)
+                      Positioned(
+                        right: 0,
+                        bottom: 0,
+                        child: Container(
+                          width: 12,
+                          height: 12,
+                          decoration: BoxDecoration(
+                            color: Colors.green,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.black, width: 2),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
                 title: Text(userName),
-                subtitle: Text('$userEmail • Age: $userAge'),
+                subtitle: Text(
+                  isOnline ? 'Online' : 'Offline', 
+                  style: TextStyle(color: isOnline ? Colors.green : Colors.grey),
+                ),
                 trailing: const Icon(Icons.chat_bubble_outline),
                 onTap: () => _createOrOpenChat(context, userDoc.id, userName),
               );
@@ -871,7 +1115,7 @@ class ContactsScreen extends StatelessWidget {
 }
 
 
-// ============= CHAT WINDOW WITH ENCRYPTION =============
+// ============= CHAT WINDOW =============
 class ChatWindow extends StatefulWidget {
   final String chatId;
   final String otherUserId;
@@ -914,7 +1158,6 @@ class _ChatWindowState extends State<ChatWindow> {
 
 
     try {
-      // Get recipient's public key
       final recipientDoc = await FirebaseFirestore.instance
           .collection('users')
           .doc(widget.otherUserId)
@@ -926,28 +1169,27 @@ class _ChatWindowState extends State<ChatWindow> {
         throw Exception('Recipient public key not found');
       }
       
-      // Encrypt message
       final encryptedData = await EncryptionService.encryptMessage(
         plainMessage: messageText,
         recipientPublicKey: recipientPublicKey,
       );
       
-      // Save encrypted message to Firebase
       await FirebaseFirestore.instance
           .collection('chats')
           .doc(widget.chatId)
           .collection('messages')
           .add({
         'senderId': currentUserId,
+        'recipientId': widget.otherUserId,
         'encryptedMessage': encryptedData['encryptedMessage'],
         'iv': encryptedData['iv'],
         'kyberCipherText': encryptedData['kyberCipherText'],
         'isEncrypted': true,
+        'status': 'sent',
         'timestamp': FieldValue.serverTimestamp(),
       });
 
 
-      // Update last message
       await FirebaseFirestore.instance.collection('chats').doc(widget.chatId).update({
         'lastMessage': 'Encrypted message 🔒',
         'lastMessageTime': FieldValue.serverTimestamp(),
@@ -971,6 +1213,34 @@ class _ChatWindowState extends State<ChatWindow> {
   }
 
 
+  Widget _buildDeliveryStatus(String status, bool isMe) {
+    if (!isMe) return const SizedBox.shrink();
+    
+    IconData icon;
+    Color color;
+    
+    switch (status) {
+      case 'sent':
+        icon = Icons.check;
+        color = Colors.grey;
+        break;
+      case 'delivered':
+        icon = Icons.done_all;
+        color = Colors.grey;
+        break;
+      case 'read':
+        icon = Icons.done_all;
+        color = Colors.blue;
+        break;
+      default:
+        icon = Icons.access_time;
+        color = Colors.grey;
+    }
+    
+    return Icon(icon, size: 14, color: color);
+  }
+
+
   @override
   Widget build(BuildContext context) {
     final currentUserId = FirebaseAuth.instance.currentUser!.uid;
@@ -978,12 +1248,41 @@ class _ChatWindowState extends State<ChatWindow> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(widget.otherUserName),
-            const Text('🔒 End-to-end encrypted', style: TextStyle(fontSize: 10, color: Colors.green)),
-          ],
+        title: StreamBuilder<DocumentSnapshot>(
+          stream: FirebaseFirestore.instance.collection('users').doc(widget.otherUserId).snapshots(),
+          builder: (context, snapshot) {
+            final userData = snapshot.data?.data() as Map<String, dynamic>?;
+            final isOnline = userData?['isOnline'] ?? false;
+            final lastSeen = userData?['lastSeen'] as Timestamp?;
+            
+            String subtitle = '🔒 End-to-end encrypted';
+            if (isOnline) {
+              subtitle = 'Online';
+            } else if (lastSeen != null) {
+              final duration = DateTime.now().difference(lastSeen.toDate());
+              if (duration.inMinutes < 60) {
+                subtitle = 'Last seen ${duration.inMinutes}m ago';
+              } else if (duration.inHours < 24) {
+                subtitle = 'Last seen ${duration.inHours}h ago';
+              } else {
+                subtitle = 'Last seen ${duration.inDays}d ago';
+              }
+            }
+            
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(widget.otherUserName),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: isOnline ? Colors.green : Colors.grey,
+                  ),
+                ),
+              ],
+            );
+          },
         ),
         elevation: 0,
       ),
@@ -1010,6 +1309,14 @@ class _ChatWindowState extends State<ChatWindow> {
                 }
 
 
+                for (var doc in snapshot.data!.docs) {
+                  final data = doc.data() as Map<String, dynamic>;
+                  if (data['recipientId'] == currentUserId && data['status'] == 'sent') {
+                    doc.reference.update({'status': 'delivered'});
+                  }
+                }
+
+
                 return ListView.builder(
                   controller: _scrollController,
                   reverse: true,
@@ -1021,6 +1328,7 @@ class _ChatWindowState extends State<ChatWindow> {
                     final senderId = messageData['senderId'];
                     final isMe = senderId == currentUserId;
                     final isEncrypted = messageData['isEncrypted'] ?? false;
+                    final status = messageData['status'] ?? 'sent';
 
 
                     return FutureBuilder<String>(
@@ -1056,9 +1364,16 @@ class _ChatWindowState extends State<ChatWindow> {
                               color: isMe ? Colors.deepPurple : Colors.grey[800],
                               borderRadius: BorderRadius.circular(16),
                             ),
-                            child: Text(
-                              decryptSnapshot.data!,
-                              style: const TextStyle(color: Colors.white),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Text(
+                                  decryptSnapshot.data!,
+                                  style: const TextStyle(color: Colors.white),
+                                ),
+                                const SizedBox(height: 4),
+                                _buildDeliveryStatus(status, isMe),
+                              ],
                             ),
                           ),
                         );
@@ -1155,6 +1470,8 @@ class SettingsScreen extends StatelessWidget {
 
 
       final userId = user.uid;
+      
+      PresenceService.stopPresenceUpdates(userId);
 
 
       await FirebaseFirestore.instance.collection('users').doc(userId).delete();
@@ -1175,7 +1492,6 @@ class SettingsScreen extends StatelessWidget {
       }
 
 
-      // Delete encryption keys
       await EncryptionService.deleteKeys();
 
 
@@ -1273,6 +1589,7 @@ class SettingsScreen extends StatelessWidget {
               const SizedBox(height: 24),
               ElevatedButton.icon(
                 onPressed: () async {
+                  PresenceService.stopPresenceUpdates(user.uid);
                   await EncryptionService.deleteKeys();
                   await FirebaseAuth.instance.signOut();
                   await GoogleSignIn().signOut();
